@@ -144,10 +144,10 @@ function AppContent() {
           </Text>
           <View style={styles.sparkline}>
             {samples.map((kb, i) => {
-              const max = Math.max(...samples, 1);
-              const min = Math.min(...samples);
-              const range = Math.max(max - min, 1);
-              const heightFraction = (kb - min) / range;
+              // Scaled against the all-time peak, not this window's min/max,
+              // so the baseline stays fixed at 0 and bar height reflects
+              // true magnitude rather than shape within a shifting range.
+              const heightFraction = kb / Math.max(peakMb * 1024, 1);
               return (
                 <View
                   key={i}
