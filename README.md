@@ -8,7 +8,7 @@ standard pattern for repositioning a one-shot source node (there's no
 `seek()` on a live `AudioBufferSourceNode`, in this library or any browser) -
 leaks native heap that `disconnect()` never releases.
 
-Filed upstream at: <!-- fill in once the issue is created -->
+Filed upstream at: https://github.com/software-mansion/react-native-audio-api/issues/1263
 
 ## What this app does
 
