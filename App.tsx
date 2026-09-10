@@ -3,12 +3,30 @@
  * pair that both wrap the SAME, already-built AudioBuffer - stopping and
  * disconnecting the previous pair before creating each new one, exactly the
  * "seek by tearing down and rebuilding the one-shot source" pattern the Web
- * Audio API requires - leaks native heap that disconnect() never releases.
+ * Audio API requires.
  *
- * Tap "Run 60 rapid seeks" and watch the RSS counter/sparkline at the top:
- * it climbs continuously during the run and never comes back down, even
- * though every source+gain pair from prior iterations should be unreachable
- * from JS by the time the next one is created.
+ * Against an UNPATCHED react-native-audio-api@0.13.3, tap "Create
+ * AudioContext" then "Run 60 rapid seeks" and watch the RSS counter/sparkline:
+ * it climbs by roughly the full buffer's size on every single seek and never
+ * comes back down, even though every source+gain pair from prior iterations
+ * should be unreachable from JS by the time the next one is created - see
+ * https://github.com/software-mansion/react-native-audio-api/issues/1263.
+ *
+ * Against the PATCHED library (see ../BPMix/patches/react-native-audio-api@0.13.3.patch,
+ * which caches the defensive buffer copy on the JS-visible AudioBuffer object
+ * instead of re-copying it on every reassignment), repeated runs settle to no
+ * net growth: only the *first* run adds a one-time bump (Hermes JIT warming
+ * up the seek loop's bytecode, audio-thread pool setup, etc.) - runs 2, 3, ...
+ * add nothing further. Confirmed via `adb shell dumpsys meminfo <pkg>` sampled
+ * before/after/+30s-settled across three consecutive runs.
+ *
+ * Gotcha found while measuring this: the in-app RSS poller below calling the
+ * native module every 500ms was ITSELF driving several MB/s of apparent
+ * "leak" even with no AudioContext ever created - the constant bridge/JS churn
+ * from polling that fast outpaces Hermes's GC cadence in a debug build. Slowing
+ * the poll interval down (or cross-checking with an external `dumpsys meminfo`
+ * sample, which isn't affected by in-app JS activity) makes that artifact
+ * disappear. Don't mistake a fast poll rate for a real leak.
  *
  * The audio content itself is irrelevant to the bug (a single 4-minute
  * silent stereo buffer, built once), so no bundled asset is needed - this
@@ -28,15 +46,33 @@ const DURATION_SECONDS = 240; // 4 minutes - long enough to be a realistic track
 const FRAME_COUNT = SAMPLE_RATE * DURATION_SECONDS;
 const SEEK_ITERATIONS = 60;
 const SEEK_INTERVAL_MS = 150; // roughly human rapid-tapping speed, not synthetic max-speed spam
+const RSS_SAMPLE_INTERVAL_MS = 2000;
+const RATE_WINDOW_SAMPLES = 6; // 3s trailing window - smooths per-sample jitter
 
 interface MemoryInfoNativeModule {
   getMemoryInfoKb(): Promise<{ rssKb: number }>;
 }
 const MemoryInfo = NativeModules.MemoryInfo as MemoryInfoNativeModule | undefined;
 
-function useRssSamples(): { latestMb: number; peakMb: number; samples: number[] } {
+// Kept on globalThis (not module-scope state) so the launch baseline and peak
+// survive a Metro Fast Refresh - which re-evaluates this module and would
+// otherwise reset both - and only reset on an actual process relaunch, which
+// is what "since launch" should mean while iterating on this file.
+interface RssGlobals {
+  __rssBaselineKb?: number;
+  __rssPeakKb?: number;
+}
+const rssGlobals = globalThis as unknown as RssGlobals;
+
+function useRssSamples(): {
+  latestMb: number;
+  peakMb: number;
+  baselineMb: number;
+  rateMbPerSec: number;
+  samples: number[];
+} {
   const [samples, setSamples] = useState<number[]>([]);
-  const peakRef = useRef(0);
+  const [, forceRender] = useState(0);
 
   useEffect(() => {
     if (!MemoryInfo) return;
@@ -44,19 +80,45 @@ function useRssSamples(): { latestMb: number; peakMb: number; samples: number[] 
       MemoryInfo!.getMemoryInfoKb()
         .then(({ rssKb }) => {
           if (rssKb < 0) return;
-          if (rssKb > peakRef.current) peakRef.current = rssKb;
+          if (!rssGlobals.__rssBaselineKb) rssGlobals.__rssBaselineKb = rssKb;
+          if (rssKb > (rssGlobals.__rssPeakKb ?? 0)) {
+            rssGlobals.__rssPeakKb = rssKb;
+            forceRender((n) => n + 1);
+          }
           setSamples((prev) => {
             const next = [...prev, rssKb];
             return next.length > 120 ? next.slice(next.length - 120) : next;
           });
         })
         .catch(() => {});
-    }, 500);
+    }, RSS_SAMPLE_INTERVAL_MS);
     return () => clearInterval(interval);
   }, []);
 
   const latestKb = samples[samples.length - 1] ?? 0;
-  return { latestMb: latestKb / 1024, peakMb: peakRef.current / 1024, samples };
+  const windowStart = samples[Math.max(0, samples.length - 1 - RATE_WINDOW_SAMPLES)];
+  const windowSpanSamples = Math.min(RATE_WINDOW_SAMPLES, samples.length - 1);
+  const rateMbPerSec =
+    windowSpanSamples > 0 && windowStart !== undefined
+      ? (latestKb - windowStart) / 1024 / ((windowSpanSamples * RSS_SAMPLE_INTERVAL_MS) / 1000)
+      : 0;
+
+  return {
+    latestMb: latestKb / 1024,
+    peakMb: (rssGlobals.__rssPeakKb ?? 0) / 1024,
+    baselineMb: (rssGlobals.__rssBaselineKb ?? 0) / 1024,
+    rateMbPerSec,
+    samples,
+  };
+}
+
+// Three-way color for the MB/s readout: green while shrinking, blue for a
+// slow/flat trickle (< 1 MB/s), red once it's climbing at a full MB/s or more -
+// the threshold that made the pre-fix ~71 MB/seek leak impossible to miss.
+function rateColorStyle(rateMbPerSec: number) {
+  if (rateMbPerSec < 0) return styles.rateDown;
+  if (rateMbPerSec < 0.3) return styles.rateFlat;
+  return styles.rateUp;
 }
 
 function delay(ms: number): Promise<void> {
@@ -73,8 +135,12 @@ function App() {
 
 function AppContent() {
   const insets = useSafeAreaInsets();
-  const { latestMb, peakMb, samples } = useRssSamples();
-  const [status, setStatus] = useState('Building silent 4-minute buffer…');
+  const { latestMb, peakMb, baselineMb, rateMbPerSec, samples } = useRssSamples();
+  const deltaMb = latestMb - baselineMb;
+  const [status, setStatus] = useState(
+    'Not started - tap "Create AudioContext" to build the engine and buffer.',
+  );
+  const [contextCreated, setContextCreated] = useState(false);
   const [iteration, setIteration] = useState(0);
   const [running, setRunning] = useState(false);
 
@@ -82,7 +148,12 @@ function AppContent() {
   const bufferRef = useRef<AudioBuffer | null>(null);
   const currentRef = useRef<{ source: any; gain: any } | null>(null);
 
-  useEffect(() => {
+  // Deferred to a button (not auto-created on mount) so the pre/post-creation
+  // RSS trend can be compared within the same running app instance - useful
+  // for telling "AudioContext's own render thread leaks even while idle" apart
+  // from ordinary app/dev-build warm-up that would happen either way.
+  const createContext = () => {
+    if (contextRef.current) return;
     const context = new AudioContext();
     contextRef.current = context;
     const buffer = context.createBuffer(CHANNELS, FRAME_COUNT, SAMPLE_RATE);
@@ -91,8 +162,9 @@ function AppContent() {
       buffer.copyToChannel(silence, channel);
     }
     bufferRef.current = buffer;
+    setContextCreated(true);
     setStatus('Ready.');
-  }, []);
+  };
 
   const stopAndDisconnectCurrent = () => {
     const current = currentRef.current;
@@ -120,7 +192,7 @@ function AppContent() {
   };
 
   const runRapidSeeks = async () => {
-    if (!bufferRef.current || running) return;
+    if (!bufferRef.current || !contextCreated || running) return;
     setRunning(true);
     createAndStartSource(0);
     for (let i = 1; i <= SEEK_ITERATIONS; i++) {
@@ -142,16 +214,30 @@ function AppContent() {
           <Text style={styles.memoryLabel}>
             RSS {latestMb.toFixed(0)} MB · peak {peakMb.toFixed(0)} MB
           </Text>
+          <Text style={styles.deltaLabel}>
+            {deltaMb >= 0 ? '+' : ''}
+            {deltaMb.toFixed(0)} MB since launch ·{' '}
+            <Text style={rateColorStyle(rateMbPerSec)}>
+              {rateMbPerSec >= 0 ? '+' : ''}
+              {rateMbPerSec.toFixed(2)} MB/s
+            </Text>
+          </Text>
           <View style={styles.sparkline}>
             {samples.map((kb, i) => {
               // Scaled against the all-time peak, not this window's min/max,
               // so the baseline stays fixed at 0 and bar height reflects
               // true magnitude rather than shape within a shifting range.
               const heightFraction = kb / Math.max(peakMb * 1024, 1);
+              const prevKb = i > 0 ? samples[i - 1] : kb;
+              // Color each bar by its trend vs. the previous sample, not its
+              // absolute level - makes a slow-but-steady climb (a handful of
+              // KB per tick) visually obvious even once it's dwarfed by peak.
+              const barColor =
+                kb > prevKb ? styles.barUp : kb < prevKb ? styles.barDown : styles.barFlat;
               return (
                 <View
                   key={i}
-                  style={[styles.bar, { height: Math.max(2, heightFraction * 40) }]}
+                  style={[styles.bar, barColor, { height: Math.max(2, heightFraction * 40) }]}
                 />
               );
             })}
@@ -163,9 +249,18 @@ function AppContent() {
         <Text style={styles.status}>Seek iteration: {iteration} / {SEEK_ITERATIONS}</Text>
 
         <Pressable
-          style={[styles.button, running && styles.buttonDisabled]}
+          style={[styles.button, contextCreated && styles.buttonDisabled]}
+          onPress={createContext}
+          disabled={contextCreated}>
+          <Text style={styles.buttonText}>
+            {contextCreated ? 'AudioContext created' : 'Create AudioContext'}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          style={[styles.button, (!contextCreated || running) && styles.buttonDisabled]}
           onPress={() => void runRapidSeeks()}
-          disabled={running}>
+          disabled={!contextCreated || running}>
           <Text style={styles.buttonText}>
             {running ? 'Running…' : `Run ${SEEK_ITERATIONS} rapid seeks`}
           </Text>
@@ -174,8 +269,10 @@ function AppContent() {
         <Text style={styles.hint}>
           Each "seek" stops+disconnects the previous AudioBufferSourceNode/GainNode pair,
           then creates a new pair wrapping the SAME AudioBuffer and starts it at a random
-          offset - the standard pattern for repositioning a one-shot source node. Watch RSS
-          above: it climbs during the run and never drops back down.
+          offset - the standard pattern for repositioning a one-shot source node. Against an
+          unpatched library, RSS climbs by roughly the buffer's size on every seek and never
+          comes back down. Repeat the run a few times to check: only the first run should add
+          net growth once the fix is applied - see the file header for measurement gotchas.
         </Text>
       </View>
     </>
@@ -197,7 +294,22 @@ const styles = StyleSheet.create({
   memoryLabel: {
     color: '#fff',
     fontSize: 13,
+    marginBottom: 2,
+  },
+  deltaLabel: {
+    color: '#ccc',
+    fontSize: 12,
     marginBottom: 4,
+    fontWeight: '600',
+  },
+  rateUp: {
+    color: '#e5484d',
+  },
+  rateFlat: {
+    color: '#3987e5',
+  },
+  rateDown: {
+    color: '#3dd68c',
   },
   sparkline: {
     height: 40,
@@ -208,6 +320,14 @@ const styles = StyleSheet.create({
   bar: {
     width: 2,
     marginRight: 1,
+  },
+  barUp: {
+    backgroundColor: '#e5484d',
+  },
+  barDown: {
+    backgroundColor: '#3dd68c',
+  },
+  barFlat: {
     backgroundColor: '#3987e5',
   },
   title: {
