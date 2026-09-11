@@ -1,34 +1,24 @@
 /**
- * Minimal repro: repeatedly creating a fresh AudioBufferSourceNode + GainNode
- * pair that both wrap the SAME, already-built AudioBuffer - stopping and
- * disconnecting the previous pair before creating each new one, exactly the
- * "seek by tearing down and rebuilding the one-shot source" pattern the Web
- * Audio API requires.
+ * Repro app for react-native-audio-api native bugs found while building BPMix.
  *
- * Against an UNPATCHED react-native-audio-api@0.13.3, tap "Create
- * AudioContext" then "Run 60 rapid seeks" and watch the RSS counter/sparkline:
- * it climbs by roughly the full buffer's size on every single seek and never
- * comes back down, even though every source+gain pair from prior iterations
- * should be unreachable from JS by the time the next one is created - see
- * https://github.com/software-mansion/react-native-audio-api/issues/1263.
+ * The original bug this app was built for - a native heap leak from
+ * re-copying an AudioBuffer on every setBuffer() reassignment during rapid
+ * seeks (https://github.com/software-mansion/react-native-audio-api/issues/1263)
+ * - is fixed upstream (PR #1281/#1283) and via
+ * ../BPMix/patches/react-native-audio-api@0.13.3.patch, so its repro UI has
+ * been removed to keep this screen focused on what's still open. The gotcha
+ * that repro surfaced is still worth knowing if you're using the RSS poller
+ * below for anything: calling the native memory-info module every 500ms was
+ * ITSELF driving several MB/s of apparent "leak" even with no AudioContext
+ * ever created - fast bridge/JS churn outpaces Hermes's GC cadence in a debug
+ * build. Slowing the poll interval down (or cross-checking with an external
+ * `adb shell dumpsys meminfo <pkg>` sample, unaffected by in-app JS activity)
+ * makes that artifact disappear.
  *
- * Against the PATCHED library (see ../BPMix/patches/react-native-audio-api@0.13.3.patch,
- * which caches the defensive buffer copy on the JS-visible AudioBuffer object
- * instead of re-copying it on every reassignment), repeated runs settle to no
- * net growth: only the *first* run adds a one-time bump (Hermes JIT warming
- * up the seek loop's bytecode, audio-thread pool setup, etc.) - runs 2, 3, ...
- * add nothing further. Confirmed via `adb shell dumpsys meminfo <pkg>` sampled
- * before/after/+30s-settled across three consecutive runs.
+ * What's left is a still-open SIGSEGV theory: see
+ * runOnEndedChurnStress/runCrossfadeStyleChurnStress's own comments below.
  *
- * Gotcha found while measuring this: the in-app RSS poller below calling the
- * native module every 500ms was ITSELF driving several MB/s of apparent
- * "leak" even with no AudioContext ever created - the constant bridge/JS churn
- * from polling that fast outpaces Hermes's GC cadence in a debug build. Slowing
- * the poll interval down (or cross-checking with an external `dumpsys meminfo`
- * sample, which isn't affected by in-app JS activity) makes that artifact
- * disappear. Don't mistake a fast poll rate for a real leak.
- *
- * The audio content itself is irrelevant to the bug (a single 4-minute
+ * The audio content itself is irrelevant to any of this (a single 4-minute
  * silent stereo buffer, built once), so no bundled asset is needed - this
  * keeps the repro to a single file with no extra dependencies.
  *
@@ -44,10 +34,23 @@ const SAMPLE_RATE = 44100;
 const CHANNELS = 2;
 const DURATION_SECONDS = 240; // 4 minutes - long enough to be a realistic track length
 const FRAME_COUNT = SAMPLE_RATE * DURATION_SECONDS;
-const SEEK_ITERATIONS = 60;
-const SEEK_INTERVAL_MS = 150; // roughly human rapid-tapping speed, not synthetic max-speed spam
+// Stress test: repro for the SIGSEGV filed against AudioEventHandlerRegistry's
+// unregisterHandler() releasing a jsi::Function off the JS thread (see the button's own
+// comment below) - deliberately much faster/longer than the seek-leak repro above, since
+// this is a race between the AudioDestructor worker thread tearing a node down and the
+// registry's own dispatch worker thread posting its "ended" event to the JS thread, and
+// needs many attempts at a tight interval to land the two on top of each other.
+const CHURN_ITERATIONS = 4000;
+const CHURN_INTERVAL_MS = 20;
+// Third stress test: closer to BPMix's actual crossfade/track-switch shape than the
+// churn above - see runCrossfadeStyleChurnStress's own comment for what's different
+// and why each difference was added.
+const CROSSFADE_ITERATIONS = 3000;
+const CROSSFADE_INTERVAL_MS = 25;
+const CROSSFADE_OVERLAP_MIN_MS = 5;
+const CROSSFADE_OVERLAP_MAX_MS = 30;
+const GC_PRESSURE_INTERVAL_MS = 4;
 const RSS_SAMPLE_INTERVAL_MS = 2000;
-const RATE_WINDOW_SAMPLES = 6; // 3s trailing window - smooths per-sample jitter
 
 interface MemoryInfoNativeModule {
   getMemoryInfoKb(): Promise<{ rssKb: number }>;
@@ -96,12 +99,13 @@ function useRssSamples(): {
   }, []);
 
   const latestKb = samples[samples.length - 1] ?? 0;
-  const windowStart = samples[Math.max(0, samples.length - 1 - RATE_WINDOW_SAMPLES)];
-  const windowSpanSamples = Math.min(RATE_WINDOW_SAMPLES, samples.length - 1);
+  // Consecutive-sample delta, not a multi-sample trailing window - a windowed
+  // average amplifies one big jump into a scarier-looking sustained rate long
+  // after the jump itself is over; comparing only the current bar to the one
+  // right before it settles back down again just as fast as RSS itself does.
+  const previousKb = samples[samples.length - 2];
   const rateMbPerSec =
-    windowSpanSamples > 0 && windowStart !== undefined
-      ? (latestKb - windowStart) / 1024 / ((windowSpanSamples * RSS_SAMPLE_INTERVAL_MS) / 1000)
-      : 0;
+    previousKb !== undefined ? (latestKb - previousKb) / 1024 / (RSS_SAMPLE_INTERVAL_MS / 1000) : 0;
 
   return {
     latestMb: latestKb / 1024,
@@ -146,6 +150,12 @@ function AppContent() {
 
   const contextRef = useRef<AudioContext | null>(null);
   const bufferRef = useRef<AudioBuffer | null>(null);
+  // Second, DISTINCT AudioBuffer/AudioBufferHostObject - BPMix's real crossfade
+  // decodes a fresh buffer per track (never reassigns the same JS AudioBuffer
+  // object across a track switch the way the leak/churn repros above do), so
+  // alternating between two real, separate buffers here is closer to that than
+  // reusing one - see runCrossfadeStyleChurnStress.
+  const bufferBRef = useRef<AudioBuffer | null>(null);
   const currentRef = useRef<{ source: any; gain: any } | null>(null);
 
   // Deferred to a button (not auto-created on mount) so the pre/post-creation
@@ -162,6 +172,13 @@ function AppContent() {
       buffer.copyToChannel(silence, channel);
     }
     bufferRef.current = buffer;
+    // Genuinely separate AudioBuffer/AudioBufferHostObject, not a second handle
+    // onto the same one - see bufferBRef's own comment.
+    const bufferB = context.createBuffer(CHANNELS, FRAME_COUNT, SAMPLE_RATE);
+    for (let channel = 0; channel < CHANNELS; channel++) {
+      bufferB.copyToChannel(silence, channel);
+    }
+    bufferBRef.current = bufferB;
     setContextCreated(true);
     setStatus('Ready.');
   };
@@ -179,11 +196,15 @@ function AppContent() {
     currentRef.current = null;
   };
 
-  const createAndStartSource = (offsetSeconds: number) => {
+  // Registers a real onended callback - that's what puts an actual
+  // jsi::Function into AudioEventHandlerRegistry's eventHandlers_ map, which
+  // is what unregisterHandler() has to release when the node is torn down.
+  const createAndStartSourceWithOnEnded = (offsetSeconds: number) => {
     const context = contextRef.current!;
     const buffer = bufferRef.current!;
     const source = context.createBufferSource({ pitchCorrection: false });
-    source.buffer = buffer; // same AudioBuffer instance every time - never rebuilt
+    source.buffer = buffer;
+    source.onEnded = () => {};
     const gain = context.createGain();
     source.connect(gain);
     gain.connect(context.destination);
@@ -191,19 +212,121 @@ function AppContent() {
     currentRef.current = { source, gain };
   };
 
-  const runRapidSeeks = async () => {
+  // Repro for the SIGSEGV filed against AudioEventHandlerRegistry::unregisterHandler():
+  // it dropped the map's last shared_ptr<jsi::Function> reference (destructing the
+  // jsi::Function) on whatever thread called it. unregisterHandler() runs from
+  // ~EventCaller(), which runs on whatever thread destroys the owning node -
+  // AudioGraphManager's nodeDestructor_ (AudioDestructor) is a dedicated background
+  // thread, not the JS thread, so a node torn down there while a fresh "ended" event
+  // for some OTHER node is concurrently in flight through the registry's dispatch
+  // worker -> JS thread pipeline races the JS thread's own live use of the Hermes
+  // runtime. Tight create/stop/destroy churn with a real onEnded listener attached
+  // (see createAndStartSourceWithOnEnded) is what's needed to actually collide the
+  // two - the leak repro above never registers a listener at all, so it can't hit this.
+  const runOnEndedChurnStress = async () => {
     if (!bufferRef.current || !contextCreated || running) return;
     setRunning(true);
-    createAndStartSource(0);
-    for (let i = 1; i <= SEEK_ITERATIONS; i++) {
-      await delay(SEEK_INTERVAL_MS);
+    createAndStartSourceWithOnEnded(0);
+    for (let i = 1; i <= CHURN_ITERATIONS; i++) {
+      await delay(CHURN_INTERVAL_MS);
       const offset = Math.random() * (DURATION_SECONDS - 5);
       stopAndDisconnectCurrent();
-      createAndStartSource(offset);
+      createAndStartSourceWithOnEnded(offset);
       setIteration(i);
     }
     stopAndDisconnectCurrent();
     setRunning(false);
+  };
+
+  // Busy-work on the JS thread with no audio API involvement at all - churns
+  // objects/strings fast enough to keep Hermes's GC actually running
+  // concurrently with the stress loop below, rather than sitting idle between
+  // its sparse allocations. BPMix's JS thread has real, unrelated work
+  // happening during a track switch (React re-renders, metadata/lyrics
+  // lookups, persistence writes) that this repro otherwise has no equivalent
+  // of - see runCrossfadeStyleChurnStress's own comment for why that
+  // concurrent JS-thread activity might matter to actually hitting the race.
+  const startGcPressure = (): (() => void) => {
+    let n = 0;
+    const handle = setInterval(() => {
+      const junk: unknown[] = [];
+      for (let i = 0; i < 200; i++) {
+        junk.push({ i, n, s: `pressure-${n}-${i}` });
+      }
+      n++;
+    }, GC_PRESSURE_INTERVAL_MS);
+    return () => clearInterval(handle);
+  };
+
+  const createAndStartOverlapping = (buffer: AudioBuffer, offsetSeconds: number) => {
+    const context = contextRef.current!;
+    const source = context.createBufferSource({ pitchCorrection: false });
+    source.buffer = buffer;
+    source.onEnded = () => {};
+    const gain = context.createGain();
+    source.connect(gain);
+    gain.connect(context.destination);
+    source.start(context.currentTime, offsetSeconds);
+    return { source, gain };
+  };
+
+  /**
+   * Repro attempt #2 for the same AudioEventHandlerRegistry::unregisterHandler()
+   * SIGSEGV theory as runOnEndedChurnStress - that first attempt (same buffer
+   * reused every iteration, strict stop-then-create, nothing else happening on
+   * the JS thread) ran 16,000 iterations with zero crashes, so it's missing
+   * something about the real BPMix conditions. Three differences from it:
+   *
+   * 1. Alternates between two DISTINCT AudioBuffers (bufferRef/bufferBRef)
+   *    instead of reusing one - BPMix always decodes a fresh buffer per track.
+   * 2. Genuinely OVERLAPS nodes instead of stopping the previous one before
+   *    starting the next: the new node starts first and is left as
+   *    currentRef, while the old one is stopped/disconnected a short random
+   *    delay later - during that window two real nodes (two EventCaller/
+   *    onEnded registrations) coexist, matching an actual crossfade's shape
+   *    instead of a strict one-at-a-time seek.
+   * 3. Runs startGcPressure() concurrently for real JS-thread/Hermes-GC
+   *    contention during the whole stress run, not just whatever incidental
+   *    GC the loop's own small allocations trigger on their own.
+   */
+  const runCrossfadeStyleChurnStress = async () => {
+    if (!bufferRef.current || !bufferBRef.current || !contextCreated || running) return;
+    setRunning(true);
+    const stopGcPressure = startGcPressure();
+    try {
+      let previous = createAndStartOverlapping(bufferRef.current, 0);
+      for (let i = 1; i <= CROSSFADE_ITERATIONS; i++) {
+        await delay(CROSSFADE_INTERVAL_MS);
+        const buffer = i % 2 === 0 ? bufferRef.current! : bufferBRef.current!;
+        const offset = Math.random() * (DURATION_SECONDS - 5);
+        const next = createAndStartOverlapping(buffer, offset);
+        currentRef.current = next;
+        const overlapMs =
+          CROSSFADE_OVERLAP_MIN_MS +
+          Math.random() * (CROSSFADE_OVERLAP_MAX_MS - CROSSFADE_OVERLAP_MIN_MS);
+        await delay(overlapMs);
+        try {
+          previous.source.stop(contextRef.current!.currentTime);
+        } catch {
+          // already stopped - fine.
+        }
+        previous.source.disconnect();
+        previous.gain.disconnect();
+        previous = next;
+        setIteration(i);
+      }
+      try {
+        previous.source.stop(contextRef.current!.currentTime);
+      } catch {
+        // already stopped - fine.
+      }
+      previous.source.disconnect();
+      previous.gain.disconnect();
+      currentRef.current = null;
+    } finally {
+      stopGcPressure();
+      setRunning(false);
+    }
   };
 
   return (
@@ -244,9 +367,9 @@ function AppContent() {
           </View>
         </View>
 
-        <Text style={styles.title}>react-native-audio-api native heap leak repro</Text>
+        <Text style={styles.title}>react-native-audio-api SIGSEGV repro</Text>
         <Text style={styles.status}>{status}</Text>
-        <Text style={styles.status}>Seek iteration: {iteration} / {SEEK_ITERATIONS}</Text>
+        <Text style={styles.status}>Iteration: {iteration}</Text>
 
         <Pressable
           style={[styles.button, contextCreated && styles.buttonDisabled]}
@@ -259,20 +382,42 @@ function AppContent() {
 
         <Pressable
           style={[styles.button, (!contextCreated || running) && styles.buttonDisabled]}
-          onPress={() => void runRapidSeeks()}
+          onPress={() => void runOnEndedChurnStress()}
           disabled={!contextCreated || running}>
           <Text style={styles.buttonText}>
-            {running ? 'Running…' : `Run ${SEEK_ITERATIONS} rapid seeks`}
+            {running ? 'Running…' : `Run ${CHURN_ITERATIONS} onended churn (SIGSEGV repro)`}
           </Text>
         </Pressable>
 
         <Text style={styles.hint}>
-          Each "seek" stops+disconnects the previous AudioBufferSourceNode/GainNode pair,
-          then creates a new pair wrapping the SAME AudioBuffer and starts it at a random
-          offset - the standard pattern for repositioning a one-shot source node. Against an
-          unpatched library, RSS climbs by roughly the buffer's size on every seek and never
-          comes back down. Repeat the run a few times to check: only the first run should add
-          net growth once the fix is applied - see the file header for measurement gotchas.
+          Each iteration registers a real `source.onEnded` listener before tearing the node
+          down, at a tight interval. Against an unpatched library this can crash the whole app
+          with a native SIGSEGV (check `adb logcat` for "Fatal signal 11" in a thread named
+          mqt_v_js, with a backtrace through jsi::Function::call / jsi::Object::setProperty
+          inside libhermesvm.so) - AudioEventHandlerRegistry::unregisterHandler() can release a
+          jsi::Function off the JS thread when the owning node is torn down by
+          AudioGraphManager's background AudioDestructor. It's a race, not deterministic -
+          multiple runs (or increasing CHURN_ITERATIONS) may be needed to hit it.
+        </Text>
+
+        <Pressable
+          style={[styles.button, (!contextCreated || running) && styles.buttonDisabled]}
+          onPress={() => void runCrossfadeStyleChurnStress()}
+          disabled={!contextCreated || running}>
+          <Text style={styles.buttonText}>
+            {running
+              ? 'Running…'
+              : `Run ${CROSSFADE_ITERATIONS} crossfade-style overlap churn`}
+          </Text>
+        </Pressable>
+
+        <Text style={styles.hint}>
+          Same SIGSEGV theory as the button above, closer to BPMix's actual crossfade shape:
+          alternates between two DISTINCT AudioBuffers instead of reusing one, genuinely
+          overlaps each new node with the outgoing one for a few ms instead of stopping it
+          first, and runs background GC-pressure busywork on the JS thread throughout - see
+          runCrossfadeStyleChurnStress's own comment for why each difference was added
+          (16,000 iterations of the simpler churn above produced zero crashes).
         </Text>
       </View>
     </>
