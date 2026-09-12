@@ -329,6 +329,36 @@ function AppContent() {
     }
   };
 
+  /**
+   * Control test: same iteration count/interval/GC-pressure shape as
+   * runCrossfadeStyleChurnStress, but with ZERO react-native-audio-api calls -
+   * no AudioContext, no nodes, nothing. Exists to answer one question: is
+   * react-native-audio-api actually necessary to produce this SIGSEGV at all,
+   * or is it a RuntimeScheduler_Modern/Hermes bug under heavy async/microtask
+   * churn that any tight `await delay(...)` loop plus concurrent GC pressure
+   * would trigger regardless? The crash backtrace itself has never shown a
+   * single react-native-audio-api frame (see the filed issue), which is what
+   * makes this worth checking directly instead of assuming.
+   */
+  const runPureJsChurnControl = async () => {
+    if (running) return;
+    setRunning(true);
+    const stopGcPressure = startGcPressure();
+    try {
+      for (let i = 1; i <= CROSSFADE_ITERATIONS; i++) {
+        await delay(CROSSFADE_INTERVAL_MS);
+        const overlapMs =
+          CROSSFADE_OVERLAP_MIN_MS +
+          Math.random() * (CROSSFADE_OVERLAP_MAX_MS - CROSSFADE_OVERLAP_MIN_MS);
+        await delay(overlapMs);
+        setIteration(i);
+      }
+    } finally {
+      stopGcPressure();
+      setRunning(false);
+    }
+  };
+
   return (
     <>
       <StatusBar barStyle="light-content" />
@@ -418,6 +448,24 @@ function AppContent() {
           first, and runs background GC-pressure busywork on the JS thread throughout - see
           runCrossfadeStyleChurnStress's own comment for why each difference was added
           (16,000 iterations of the simpler churn above produced zero crashes).
+        </Text>
+
+        <Pressable
+          style={[styles.button, running && styles.buttonDisabled]}
+          onPress={() => void runPureJsChurnControl()}
+          disabled={running}>
+          <Text style={styles.buttonText}>
+            {running ? 'Running…' : `Run ${CROSSFADE_ITERATIONS} pure-JS churn (control, no audio API)`}
+          </Text>
+        </Pressable>
+
+        <Text style={styles.hint}>
+          Control test - same timing/GC-pressure shape as the button above but with ZERO
+          react-native-audio-api calls (no AudioContext, no nodes). Doesn't need "Create
+          AudioContext" first. If this crashes too, react-native-audio-api isn't actually
+          required to trigger the SIGSEGV - it'd point at RuntimeScheduler_Modern/Hermes
+          itself under heavy async/microtask churn instead, which would match the crash
+          backtrace never showing a react-native-audio-api frame in the first place.
         </Text>
       </View>
     </>
